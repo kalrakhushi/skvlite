@@ -1,7 +1,7 @@
 import os
 import pickle
 import sqlite3
-import bz2
+import lzma  # Importing lzma module instead of zlib
 from typing import Any, Generator, Mapping, Optional, Tuple, TypeVar, cast
 
 from pytools.persistent_dict import KeyBuilder
@@ -39,13 +39,9 @@ class KVStore(Mapping[K, V]):
 
         if container_dir is None:
             import sys
-
             import platformdirs
 
             if sys.platform == "darwin" and os.getenv("XDG_CACHE_HOME") is not None:
-
-                # platformdirs does not handle XDG_CACHE_HOME on macOS    
-                # https://github.com/platformdirs/platformdirs/issues/269
                 container_dir = join(
                     cast(str, os.getenv("XDG_CACHE_HOME")), "pytools")
             else:
@@ -56,8 +52,7 @@ class KVStore(Mapping[K, V]):
 
         self.key_builder = KeyBuilder()
 
-        # isolation_level=None: enable autocommit mode    
-        # https://www.sqlite.org/lang_transaction.html#implicit_versus_explicit_transactions
+        # isolation_level=None: enable autocommit mode
         self.conn = sqlite3.connect(self.filename, isolation_level=None)
 
         self._exec_sql(
@@ -65,19 +60,17 @@ class KVStore(Mapping[K, V]):
             "(keyhash TEXT NOT NULL PRIMARY KEY, key_value BLOB NOT NULL)"
         )
 
-        # https://www.sqlite.org/wal.html
+        # Enable WAL mode if specified
         if enable_wal:
             self._exec_sql("PRAGMA journal_mode = 'WAL'")
 
         # Use in-memory temp store
-        # https://www.sqlite.org/pragma.html#pragma_temp_store
         self._exec_sql("PRAGMA temp_store = 'MEMORY'")
 
-        # https://www.sqlite.org/pragma.html#pragma_synchronous
+        # Set synchronous to NORMAL
         self._exec_sql("PRAGMA synchronous = 'NORMAL'")
 
-        # 64 MByte of cache
-        # https://www.sqlite.org/pragma.html#pragma_cache_size
+        # Set cache size to 64 MByte
         self._exec_sql("PRAGMA cache_size = -64000")
 
     def _exec_sql(self, *args: Any) -> Any:
@@ -91,7 +84,6 @@ class KVStore(Mapping[K, V]):
 
     def _collision_check(self, key: K, stored_key: K) -> None:
         if stored_key != key:
-            # Key collision, oh well.
             raise Exception(
                 f"Key collision in cache at "
                 f"'{self.filename}' -- these are sufficiently unlikely "
@@ -103,24 +95,22 @@ class KVStore(Mapping[K, V]):
     def _store_data(self, key: K, value: V, replace: bool) -> None:
         keyhash = self.key_builder(key)
         pickled_data = pickle.dumps((key, value))
-        compressed_data = bz2.compress(pickled_data)
+        # Compress using lzma instead of zlib
+        compressed_data = lzma.compress(pickled_data)
 
-        if replace:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO dict VALUES (?, ?)", (keyhash, compressed_data)
-            )
-        else:
-            self.conn.execute(
-                "INSERT OR IGNORE INTO dict VALUES (?, ?)", (keyhash, compressed_data)
-            )
+        mode = "REPLACE" if replace else "IGNORE"
 
-    def _load_data(self, keyhash: str) -> Tuple[K, V]:
-        c = self.conn.execute("SELECT key_value FROM dict WHERE keyhash=?", (keyhash,))
+        self._exec_sql(
+            f"INSERT OR {mode} INTO dict VALUES (?, ?)", (keyhash, compressed_data)
+        )
+
+    def _load_data(self, keyhash: str) -> Any:
+        c = self._exec_sql("SELECT key_value FROM dict WHERE keyhash=?", (keyhash,))
         row = c.fetchone()
         if row is None:
             raise NoSuchEntryError(keyhash)
         compressed_data = row[0]
-        pickled_data = bz2.decompress(compressed_data)
+        pickled_data = lzma.decompress(compressed_data)  # Decompress using lzma
         return pickle.loads(pickled_data)
 
     def store(self, key: K, value: V, _skip_if_present: bool = False) -> None:
@@ -140,7 +130,6 @@ class KVStore(Mapping[K, V]):
         return self.fetch(key)
 
     def remove(self, key: K) -> None:
-        #  Remove the entry associated with *key* from the dictionary.
         keyhash = self.key_builder(key)
 
         while True:
@@ -148,7 +137,6 @@ class KVStore(Mapping[K, V]):
                 self.conn.execute("BEGIN EXCLUSIVE TRANSACTION")
 
                 try:
-                    # This is split into SELECT/DELETE to allow for a collision check
                     c = self.conn.execute(
                         "SELECT key_value FROM dict WHERE keyhash=?", (keyhash,)
                     )
@@ -157,7 +145,7 @@ class KVStore(Mapping[K, V]):
                         raise NoSuchEntryError(key)
 
                     compressed_data = row[0]
-                    pickled_data = bz2.decompress(compressed_data)
+                    pickled_data = lzma.decompress(compressed_data)
 
                     stored_key, _value = pickle.loads(pickled_data)
                     self._collision_check(key, stored_key)
@@ -168,7 +156,6 @@ class KVStore(Mapping[K, V]):
                     self.conn.execute("ROLLBACK")
                     raise e
             except sqlite3.OperationalError as e:
-                # If the database is busy, retry
                 if hasattr(e, "sqlite_errorcode") and not e.sqlite_errorcode == sqlite3.SQLITE_BUSY:
                     raise
             else:
@@ -178,46 +165,37 @@ class KVStore(Mapping[K, V]):
         self.remove(key)
 
     def __len__(self) -> int:
-        """Return the number of entries in the dictionary."""
         return cast(int, next(self._exec_sql("SELECT COUNT(*) FROM dict"))[0])
 
     def __iter__(self) -> Generator[K, None, None]:
         return self.keys()
 
-    def keys(self) -> Generator[K, None, None]:  # type: ignore[override]
-        """Return an iterator over the keys in the dictionary."""
+    def keys(self) -> Generator[K, None, None]:
         for row in self._exec_sql("SELECT key_value FROM dict ORDER BY rowid"):
-            pickled_data = bz2.decompress(row[0])
+            pickled_data = lzma.decompress(row[0])
             yield pickle.loads(pickled_data)[0]
 
-    def values(self) -> Generator[V, None, None]:  # type: ignore[override]
-        """Return an iterator over the values in the dictionary."""
+    def values(self) -> Generator[V, None, None]:
         for row in self._exec_sql("SELECT key_value FROM dict ORDER BY rowid"):
-            pickled_data = bz2.decompress(row[0])
+            pickled_data = lzma.decompress(row[0])
             yield pickle.loads(pickled_data)[1]
 
-    def items(self) -> Generator[Tuple[K, V], None, None]:  # type: ignore[override]
-        """Return an iterator over the items in the dictionary."""
+    def items(self) -> Generator[Tuple[K, V], None, None]:
         for row in self._exec_sql("SELECT key_value FROM dict ORDER BY rowid"):
-            pickled_data = bz2.decompress(row[0])
+            pickled_data = lzma.decompress(row[0])
             yield pickle.loads(pickled_data)
 
     def nbytes(self) -> int:
-        """Return the size of the dictionary in bytes."""
-        return cast(
-            int,
-            next(
-                self._exec_sql(
-                    "SELECT page_size * page_count FROM pragma_page_size(), pragma_page_count()"
-                )
-            )[0],
-        )
+        return cast(int,
+                    next(self._exec_sql("SELECT page_size * page_count FROM "
+                                        "pragma_page_size(), pragma_page_count()")
+                         )[0]
+                    )
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.filename}, nitems={len(self)})"
 
     def clear(self) -> None:
-        """Remove all entries from the dictionary."""
         self._exec_sql("DELETE FROM dict")
 
     def store_if_not_present(self, key: Any, value: Any) -> None:
