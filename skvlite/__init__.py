@@ -1,7 +1,7 @@
 import os
 import pickle
 import sqlite3
-import lzma  # Importing lzma module instead of zlib
+import lzma  
 from typing import Any, Generator, Mapping, Optional, Tuple, TypeVar, cast
 
 from pytools.persistent_dict import KeyBuilder
